@@ -1,5 +1,7 @@
 const std = @import("std");
 const microzig = @import("microzig");
+const bme280 = @import("bme280.zig");
+const font8x8 = @import("font8x8");
 
 const rp2xxx = microzig.hal;
 const time = rp2xxx.time;
@@ -60,6 +62,8 @@ const REG_CHIP_ID: u8 = 0xD0;
 pub fn main() !void {
     const pins = pin_config.apply();
 
+    time.sleep_ms(250); // let the OLED + MBE280 finish their power-on before I2C init
+
     // Configure I2C0 on GPIO4 (SDA) / GPIO5 (SCL). Pins are set up separately
     // from i2c.apply() — they are not part of the I2C Config.
     const i2c0 = rp2xxx.i2c.instance.num(0);
@@ -75,9 +79,26 @@ pub fn main() !void {
     // Read the chip-ID register. Don't `try` here: a missing/miswired sensor
     // would otherwise fault the chip before USB enumerates, leaving no output.
     // Capture the result and report it over USB instead.
-    var id_buffer: [1]u8 = .{0};
-    const id_result = i2c0.write_then_read_blocking(BME280_ADDR, &.{REG_CHIP_ID}, &id_buffer, null);
+    // var id_buffer: [1]u8 = .{0};
+    // const id_result = i2c0.write_then_read_blocking(BME280_ADDR, &.{REG_CHIP_ID}, &id_buffer, null);
+    var sensor = bme280.BME280.init(i2c0, BME280_ADDR) catch null;
 
+    const ssd1306 = microzig.drivers.display.ssd1306;
+    const oled_dd = rp2xxx.drivers.I2C_Datagram_Device.init(
+        i2c0, @enumFromInt(0x3C), null
+    );
+    const lcd = ssd1306.init(
+        .i2c, oled_dd, null
+    ) catch null; // ?Display — keeps USB alive if absent
+
+    if (lcd) |l| {
+        var screen: [16 * 8]u8 = @splat(' ');
+        _ = std.fmt.bufPrint(screen[16..32], "     Hello!", .{}) catch {};
+        _ = std.fmt.bufPrint(screen[48..64], "     Weather", .{}) catch {};
+        var glyphs: [screen.len * 8]u8 = undefined;
+        _ = font8x8.Fonts.draw(&glyphs, &screen); // fills all 1024 bytes of glyphs with font data
+        l.write_full_display(&glyphs) catch {}; // sets addressing window + write full frame
+    }
     // Initialize the USB device. The host will enumerate it as a serial port.
     usb_device = .init();
 
@@ -85,28 +106,48 @@ pub fn main() !void {
     var i: u32 = 0;
 
     while (true) {
-        // Must be polled frequently to service USB events.
+        // Must be polled frequently to service USB events. REQUIRED even if we
+        // don't use CDC: picotool's `-f` reboot talks to the ResetDriver, which
+        // only responds while this is being polled. poll() is non-blocking.
         usb_device.poll(&usb_controller);
 
-        // drivers() is non-null only once the host has finished enumeration.
-        if (usb_controller.drivers()) |drivers| {
-            const now = time.get_time_since_boot().to_us();
-            if (now - last > 1_000_000) {
-                last = now;
-                pins.led.toggle();
-                i += 1;
-                usb_cdc_write(&drivers.serial, "LED is ON ({})\r\n", .{i});
+        const now = time.get_time_since_boot().to_us();
 
-                if (id_result) |_| {
-                    const id = id_buffer[0];
-                    const name = switch (id) {
-                        0x60 => "BME280-60",
-                        0x58 => "BMP280-58",
-                        else => "Unknown",
-                    };
-                    usb_cdc_write(&drivers.serial, "{s} chip ID: 0x{X:0>2}\r\n", .{ name, id });
-                } else |err| {
-                    usb_cdc_write(&drivers.serial, "BME280 read failed: {s}\r\n", .{@errorName(err)});
+        if (now - last > 1_000_000) {
+            last = now;
+            pins.led.toggle();
+            i += 1;
+
+            // Time for Display
+            const secs = now / 1_000_000;
+            const hh = secs / 3600;
+            const mm = (secs % 3600) / 60;
+            const ss = secs % 60;
+
+            if (sensor) |*s| {
+                if (s.measure()) |m| {
+                    var screen: [16 * 8]u8 = @splat(' ');       // 4 rows, all spaces
+                    _ = std.fmt.bufPrint(screen[0..16], "T:{d:.1}C", .{ m.temperature_c }) catch {};
+                    _ = std.fmt.bufPrint(screen[32..48], "P:{d:.0}hPa", .{ m.pressure_pa / 100.0}) catch {};
+                    _ = std.fmt.bufPrint(screen[64..80], "H:{d:.1}%", .{ m.humidity_rh}) catch {};
+                    _ = std.fmt.bufPrint(screen[96..112], "U:{d:0>2}:{d:0>2}:{d:0>2}", .{ hh, mm, ss}) catch {};
+
+                    var glyphs: [screen.len * 8]u8 = undefined;  // 8 bytes per char
+                    if (lcd) |l| {
+                        _ = font8x8.Fonts.draw(&glyphs, &screen); // fills all 1024 bytes of glyphs with font data
+                        l.write_full_display(&glyphs) catch {}; // sets addressing window + write full frame
+                        if (usb_controller.drivers()) |drivers| {
+                            usb_cdc_write(&drivers.serial, "T: {d:.2} C  P: {d:.2} hPa  H: {d:.2} %\r\n",
+                                .{ m.temperature_c, m.pressure_pa / 100.0, m.humidity_rh });
+                        }
+                    }
+                    // } else |err|{
+                    //     std.log.debug("Err: {s}", .{ @errorName(err) });
+                    //     // usb_cdc_write(&drivers.serial, "measure failed: {s}\r\n", .{@errorName(err)});
+                    // }
+                } else |err|{
+                    std.log.debug("Err: {s}", .{ @errorName(err) });
+                    // usb_cdc_write(&drivers.serial, "BME280 not found\r\n", .{});
                 }
             }
         }
@@ -119,11 +160,15 @@ var usb_tx_buff: [256]u8 = undefined;
 pub fn usb_cdc_write(serial: *USB_Serial, comptime fmt: []const u8, args: anytype) void {
     var tx = std.fmt.bufPrint(&usb_tx_buff, fmt, args) catch &.{};
 
-    while (tx.len > 0) {
-        tx = tx[serial.write(tx)..];
+    var stalls: u8 = 8;
+    while (tx.len > 0 and stalls < 16) {
+        const n = serial.write(tx);
+        if (n == 0) stalls += 1 else stalls = 0; // count only no-progress polls
+        tx = tx[n..];
         usb_device.poll(&usb_controller);
     }
-    // Short messages buffer up, so force a flush.
-    while (!serial.flush())
+
+    stalls = 0;
+    while (!serial.flush() and stalls < 16) : (stalls += 1)
         usb_device.poll(&usb_controller);
 }

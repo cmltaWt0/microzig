@@ -76,7 +76,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "spi-loopback-dma", .file = "src/spi_loopback_dma.zig" },
         .{ .name = "squarewave", .file = "src/squarewave.zig" },
         .{ .name = "ws2812", .file = "src/ws2812.zig" },
-        .{ .name = "blinky", .file = "src/blinky.zig" },
+        .{ .name = "blinky", .file = "src/blinky.zig", .imports = &.{
+            .{ .name = "font8x8", .module = font8x8_dep.module("font8x8") },
+        } },
         .{ .name = "ds18b20", .file = "src/ds18b20.zig" },
         .{ .name = "gpio-clock-output", .file = "src/gpio_clock_output.zig" },
         .{ .name = "gpio-interrupts", .file = "src/gpio_irq.zig" },
