@@ -79,6 +79,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "blinky", .file = "src/blinky.zig", .imports = &.{
             .{ .name = "font8x8", .module = font8x8_dep.module("font8x8") },
         } },
+        .{ .name = "sysmon", .file = "src/sysmon.zig", .imports = &.{
+            .{ .name = "font8x8", .module = font8x8_dep.module("font8x8") },
+        } },
         .{ .name = "ds18b20", .file = "src/ds18b20.zig" },
         .{ .name = "gpio-clock-output", .file = "src/gpio_clock_output.zig" },
         .{ .name = "gpio-interrupts", .file = "src/gpio_irq.zig" },
