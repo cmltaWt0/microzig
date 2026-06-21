@@ -1,3 +1,14 @@
+//! BME280 temperature / pressure / humidity driver (I2C, forced mode).
+//!
+//! Sources:
+//!   - Bosch BME280 datasheet, BST-BME280-DS002
+//!     https://www.bosch-sensortec.com/media/boschsensortec/downloads/datasheets/bst-bme280-ds002.pdf
+//!       §4.2.2  Trimming parameter (calibration) readout: regs 0x88-0xA1, 0xE1-0xE7
+//!       §4.2.3 / §8  Compensation formulas (double-precision variants used here)
+//!       §3.3  Forced mode;  §5.4  Register map (id 0xD0, ctrl_hum 0xF2,
+//!             ctrl_meas 0xF4, config 0xF5, data 0xF7-0xFE)
+//!   - Bosch reference C driver (dig_H4/H5 packing): https://github.com/boschsensortec/BME280_SensorAPI
+
 const std = @import("std");
 const microzig = @import("microzig");
 const rp2xxx = microzig.hal;
