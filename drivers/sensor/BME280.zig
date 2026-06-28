@@ -190,6 +190,41 @@ test "BME280 init rejects wrong chip id" {
     );
 }
 
+test "BME280 fixed-point compensation matches f64 reference across the range" {
+    const cal = test_calibration;
+
+    const Vector = struct { adc_t: i32, adc_p: i32, adc_h: i32 };
+    const vectors = [_]Vector{
+        .{ .adc_t = 415000, .adc_p = 350000, .adc_h = 25975 }, // cool / low pressure / drier
+        .{ .adc_t = 519888, .adc_p = 415148, .adc_h = 33000 }, // mid
+        .{ .adc_t = 620000, .adc_p = 480000, .adc_h = 42000 }, // warm / high pressure / humid
+    };
+
+    for (vectors) |vec| {
+        const t = compensate_temperature(cal, vec.adc_t);
+        const p = compensate_pressure(cal, t.t_fine, vec.adc_p);
+        const h = compensate_humidity(cal, t.t_fine, vec.adc_h);
+
+        const rt = ref.temperature(cal, vec.adc_t); // independent f64 t_fine per vector
+        try std.testing.expectApproxEqAbs(rt.celsius, ref.f(t.hundredths_c) / 100.0, 0.05);
+        try std.testing.expectApproxEqAbs(ref.pressure_pa(cal, rt.t_fine, vec.adc_p), ref.f(p) / 256.0, 3.0);
+        try std.testing.expectApproxEqAbs(ref.humidity_rh(cal, rt.t_fine, vec.adc_h), ref.f(h) / 1024.0, 0.2);
+    }
+}
+
+test "BME280 humidity compensation clamps to 0..100 %RH" {
+    const cal = test_calibration;
+    const t_fine: i32 = 100000; // ~19.5 °C, a valid fine-temperature
+
+    // Very dry: the uncompensated value goes negative. Without the lower clamp
+    // this would make `v >> 12` negative and PANIC the `@intCast`. Expect exactly 0.
+    try std.testing.expectEqual(@as(u32, 0), compensate_humidity(cal, t_fine, 0));
+
+    // Saturated: a max raw reading must never report above 100 %RH.
+    // 100 %RH in Q22.10 == 100 * 1024 == 102400.
+    try std.testing.expect(compensate_humidity(cal, t_fine, 65535) <= 100 * 1024);
+}
+
 // Float reference implementation, used only to cross-check the integer math in tests.
 const ref = struct {
     fn f(v: anytype) f64 {
@@ -231,37 +266,23 @@ const ref = struct {
     }
 };
 
-test "BME280 fixed-point compensation matches f64 reference" {
-    const cal = Calibration{
-        .t1 = 28485,
-        .t2 = 26735,
-        .t3 = 50,
-        .p1 = 36738,
-        .p2 = -10635,
-        .p3 = 3024,
-        .p4 = 7228,
-        .p5 = -154,
-        .p6 = -7,
-        .p7 = 9900,
-        .p8 = -10230,
-        .p9 = 4285,
-        .h1 = 75,
-        .h2 = 362,
-        .h3 = 0,
-        .h4 = 308,
-        .h5 = 0,
-        .h6 = 30,
-    };
-    const adc_t: i32 = 519888;
-    const adc_p: i32 = 415148;
-    const adc_h: i32 = 25975;
-
-    const t = compensate_temperature(cal, adc_t);
-    const p = compensate_pressure(cal, t.t_fine, adc_p);
-    const h = compensate_humidity(cal, t.t_fine, adc_h);
-
-    const rt = ref.temperature(cal, adc_t);
-    try std.testing.expectApproxEqAbs(rt.celsius, ref.f(t.hundredths_c) / 100.0, 0.05);
-    try std.testing.expectApproxEqAbs(ref.pressure_pa(cal, rt.t_fine, adc_p), ref.f(p) / 256.0, 3.0);
-    try std.testing.expectApproxEqAbs(ref.humidity_rh(cal, rt.t_fine, adc_h), ref.f(h) / 1024.0, 0.2);
-}
+const test_calibration = Calibration{
+    .t1 = 28485,
+    .t2 = 26735,
+    .t3 = 50,
+    .p1 = 36738,
+    .p2 = -10635,
+    .p3 = 3024,
+    .p4 = 7228,
+    .p5 = -154,
+    .p6 = -7,
+    .p7 = 9900,
+    .p8 = -10230,
+    .p9 = 4285,
+    .h1 = 75,
+    .h2 = 362,
+    .h3 = 0,
+    .h4 = 308,
+    .h5 = 0,
+    .h6 = 30,
+};
