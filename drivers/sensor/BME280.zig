@@ -29,10 +29,34 @@ pub const BME280_Config = struct {
     i2c: mdf.base.I2C_Device,
     address: mdf.base.I2C_Device.Address,
     clock: mdf.base.Clock_Device,
+
+    temperature_oversampling: Oversampling = .x1,
+    pressure_oversampling: Oversampling = .x1,
+    humidity_oversampling: Oversampling = .x1,
+
+    filter: Filter = .off,
 };
 
 pub const BME280 = struct {
     const Self = @This();
+
+    const CtrlMeas = packed struct(u8) {
+        mode: Mode, // bits 0–1
+        osrs_p: Oversampling, // bits 2–4
+        osrs_t: Oversampling, // bits 5–7
+    };
+
+    const CtrlHum = packed struct(u8) {
+        osrs_h: Oversampling, // bits 0–2  (3 bits)
+        reserved: u5 = 0, // bits 3–7  (5 bits, always 0)
+    };
+
+    const ConfigReg = packed struct(u8) {
+        spi3w_en: u1 = 0, // bit 0
+        reserved: u1 = 0, // bit 1
+        filter: Filter, // bits 2–4
+        standby: u3 = 0, // bits 5–7 (raw for now; Stage 5 makes it an enum)
+    };
 
     pub const Error = mdf.base.I2C_Device.InterfaceError || error{UnexpectedChipId};
     pub const Measurement = struct {
@@ -55,6 +79,10 @@ pub const BME280 = struct {
     address: mdf.base.I2C_Device.Address,
     clock: mdf.base.Clock_Device,
     cal: Calibration,
+
+    temperature_oversampling: Oversampling,
+    pressure_oversampling: Oversampling,
+    humidity_oversampling: Oversampling,
 
     /// Read `dst.len` bytes starting at `reg` (BME280 auto-increments on multi-byte reads).
     fn read_registers(self: *const Self, reg: Register, dst: []u8) mdf.base.I2C_Device.InterfaceError!void {
@@ -93,12 +121,23 @@ pub const BME280 = struct {
         };
     }
 
+    fn measurement_time_us(self: *const Self) u32 {
+        var us: u32 = 1250; // 1.25 ms base
+        us += 2300 * self.temperature_oversampling.factor();
+        if (self.pressure_oversampling != .skip) us += 2300 * self.pressure_oversampling.factor() + 575;
+        if (self.humidity_oversampling != .skip) us += 2300 * self.humidity_oversampling.factor() + 575;
+        return us;
+    }
+
     pub fn init(config: BME280_Config) Error!Self {
         var self = Self{
             .i2c = config.i2c,
             .address = config.address,
             .clock = config.clock,
             .cal = undefined, // filled below, before init returns or anything reads it
+            .temperature_oversampling = config.temperature_oversampling,
+            .pressure_oversampling = config.pressure_oversampling,
+            .humidity_oversampling = config.humidity_oversampling,
         };
 
         var id_buf: [1]u8 = undefined;
@@ -106,14 +145,21 @@ pub const BME280 = struct {
         if (id_buf[0] != chip_id) return error.UnexpectedChipId;
 
         self.cal = try self.read_calibration();
+        // write config
+        try self.write_register(.config, @bitCast(ConfigReg{ .filter = config.filter }));
+
         return self;
     }
 
     pub fn measure(self: *const Self) Error!Measurement {
-        try self.write_register(.ctrl_hum, 0x01);
-        try self.write_register(.ctrl_meas, 0x25);
+        try self.write_register(.ctrl_hum, @bitCast(CtrlHum{ .osrs_h = self.humidity_oversampling }));
+        try self.write_register(.ctrl_meas, @bitCast(CtrlMeas{
+            .mode = .forced,
+            .osrs_p = self.pressure_oversampling,
+            .osrs_t = self.temperature_oversampling,
+        }));
 
-        self.clock.sleep_ms(10);
+        self.clock.sleep_us(self.measurement_time_us());
 
         var buf: [8]u8 = undefined;
         try self.read_registers(.data, &buf);
@@ -152,6 +198,28 @@ pub const Calibration = struct {
     h5: i16,
     h6: i8,
 };
+
+pub const Oversampling = enum(u3) {
+    skip = 0,
+    x1 = 1,
+    x2 = 2,
+    x4 = 3,
+    x8 = 4,
+    x16 = 5,
+
+    fn factor(self: Oversampling) u32 { // the multiplier, for the conversion-time formula
+        return switch (self) {
+            .skip => 0,
+            .x1 => 1,
+            .x2 => 2,
+            .x4 => 4,
+            .x8 => 8,
+            .x16 => 16,
+        };
+    }
+};
+pub const Filter = enum(u3) { off = 0, x2 = 1, x4 = 2, x8 = 3, x16 = 4 };
+pub const Mode = enum(u2) { sleep = 0, forced = 1, normal = 3 }; // 2 is also "forced"; we use 1
 
 const Temperature = struct { t_fine: i32, hundredths_c: i32 };
 
@@ -236,7 +304,12 @@ test "BME280 init verifies chip id" {
     });
 
     // init must have written the id register address (0xD0) to read it back.
-    try td.expect_sent(&.{ &.{0xD0}, &.{0x88}, &.{0xE1} });
+    try td.expect_sent(&.{
+        &.{0xD0},
+        &.{0x88},
+        &.{0xE1},
+        &.{ 0xF5, 0x00 },
+    });
 }
 
 test "BME280 init rejects wrong chip id" {
@@ -334,8 +407,39 @@ test "BME280 init parses calibration and measure() reads + compensates" {
 
     try td.expect_sent(&.{
         &.{0xD0}, &.{0x88}, &.{0xE1}, // id, calib_tp, calib_h (init)
+        &.{ 0xF5, 0x00 }, // config register (init): filter = off → 0x00   ← NEW
         &.{ 0xF2, 0x01 }, &.{ 0xF4, 0x25 }, // ctrl_hum, ctrl_meas (measure)
         &.{0xF7}, // data burst (measure)
+    });
+}
+
+test "BME280 oversampling and filter settings produce the right register bytes" {
+    const Test_I2C = mdf.base.I2C_Device.Test_Device;
+    const Test_Clock = mdf.base.Clock_Device.Test_Device;
+
+    // id + zeroed calib blocks + zeroed data — we only assert the writes here.
+    const reads = [_][]const u8{ &.{0x60}, &[_]u8{0} ** 26, &[_]u8{0} ** 7, &[_]u8{0} ** 8 };
+    var td = Test_I2C.init(&reads, true);
+    defer td.deinit();
+    var tc = Test_Clock.init();
+
+    const dev = try BME280.init(.{
+        .i2c = td.i2c_device(),
+        .address = @enumFromInt(0x76),
+        .clock = tc.clock_device(),
+        .temperature_oversampling = .x16,
+        .pressure_oversampling = .x4,
+        .humidity_oversampling = .x2,
+        .filter = .x16,
+    });
+    _ = try dev.measure();
+
+    try td.expect_sent(&.{
+        &.{0xD0}, &.{0x88}, &.{0xE1}, // init reads
+        &.{ 0xF5, 0x10 }, // config:    filter ×16 → 4<<2          = 0x10
+        &.{ 0xF2, 0x02 }, // ctrl_hum:  osrs_h ×2                   = 0x02
+        &.{ 0xF4, 0xAD }, // ctrl_meas: osrs_t ×16<<5 | osrs_p ×4<<2 | forced
+        &.{0xF7}, // data burst
     });
 }
 
