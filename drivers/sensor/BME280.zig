@@ -35,29 +35,100 @@ pub const BME280 = struct {
     const Self = @This();
 
     pub const Error = mdf.base.I2C_Device.InterfaceError || error{UnexpectedChipId};
+    pub const Measurement = struct {
+        temperature: i32, // °C × 100 (2534 → 25.34 °C)
+        pressure: u32, // Pa, Q24.8   (÷ 256)
+        humidity: u32, // %RH, Q22.10 (÷ 1024)
+
+        pub fn temperature_celsius(self: Measurement) f32 {
+            return @as(f32, @floatFromInt(self.temperature)) / 100.0;
+        }
+        pub fn pressure_pascal(self: Measurement) f32 {
+            return @as(f32, @floatFromInt(self.pressure)) / 256.0;
+        }
+        pub fn humidity_percent(self: Measurement) f32 {
+            return @as(f32, @floatFromInt(self.humidity)) / 1024.0;
+        }
+    };
 
     i2c: mdf.base.I2C_Device,
     address: mdf.base.I2C_Device.Address,
     clock: mdf.base.Clock_Device,
+    cal: Calibration,
 
     /// Read `dst.len` bytes starting at `reg` (BME280 auto-increments on multi-byte reads).
-    fn read_registers(self: Self, reg: Register, dst: []u8) mdf.base.I2C_Device.InterfaceError!void {
+    fn read_registers(self: *const Self, reg: Register, dst: []u8) mdf.base.I2C_Device.InterfaceError!void {
         try self.i2c.write_then_read(self.address, &.{reg.v()}, dst);
     }
 
+    fn write_register(self: *const Self, reg: Register, value: u8) mdf.base.I2C_Device.InterfaceError!void {
+        try self.i2c.write(self.address, &.{ reg.v(), value });
+    }
+
+    fn read_calibration(self: *const Self) mdf.base.I2C_Device.InterfaceError!Calibration {
+        var tp: [26]u8 = undefined;
+        try self.read_registers(.calib_tp, &tp);
+        var h: [7]u8 = undefined;
+        try self.read_registers(.calib_h, &h);
+
+        return .{
+            .t1 = std.mem.readInt(u16, tp[0..2], .little),
+            .t2 = std.mem.readInt(i16, tp[2..4], .little),
+            .t3 = std.mem.readInt(i16, tp[4..6], .little),
+            .p1 = std.mem.readInt(u16, tp[6..8], .little),
+            .p2 = std.mem.readInt(i16, tp[8..10], .little),
+            .p3 = std.mem.readInt(i16, tp[10..12], .little),
+            .p4 = std.mem.readInt(i16, tp[12..14], .little),
+            .p5 = std.mem.readInt(i16, tp[14..16], .little),
+            .p6 = std.mem.readInt(i16, tp[16..18], .little),
+            .p7 = std.mem.readInt(i16, tp[18..20], .little),
+            .p8 = std.mem.readInt(i16, tp[20..22], .little),
+            .p9 = std.mem.readInt(i16, tp[22..24], .little),
+            .h1 = tp[25], // tp[24] is 0xA0 (reserved)
+            .h2 = std.mem.readInt(i16, h[0..2], .little),
+            .h3 = h[2],
+            .h4 = (@as(i16, @as(i8, @bitCast(h[3]))) * 16) | @as(i16, h[4] & 0x0F),
+            .h5 = (@as(i16, @as(i8, @bitCast(h[5]))) * 16) | @as(i16, h[4] >> 4),
+            .h6 = @bitCast(h[6]),
+        };
+    }
+
     pub fn init(config: BME280_Config) Error!Self {
-        const self = Self{
+        var self = Self{
             .i2c = config.i2c,
             .address = config.address,
             .clock = config.clock,
+            .cal = undefined, // filled below, before init returns or anything reads it
         };
 
         var id_buf: [1]u8 = undefined;
-
         try self.read_registers(.id, &id_buf);
         if (id_buf[0] != chip_id) return error.UnexpectedChipId;
 
+        self.cal = try self.read_calibration();
         return self;
+    }
+
+    pub fn measure(self: *const Self) Error!Measurement {
+        try self.write_register(.ctrl_hum, 0x01);
+        try self.write_register(.ctrl_meas, 0x25);
+
+        self.clock.sleep_ms(10);
+
+        var buf: [8]u8 = undefined;
+        try self.read_registers(.data, &buf);
+
+        // MSB-first ADC packings
+        const adc_p: i32 = (@as(i32, buf[0]) << 12) | (@as(i32, buf[1]) << 4) | (@as(i32, buf[2]) >> 4);
+        const adc_t: i32 = (@as(i32, buf[3]) << 12) | (@as(i32, buf[4]) << 4) | (@as(i32, buf[5]) >> 4);
+        const adc_h: i32 = (@as(i32, buf[6]) << 8) | @as(i32, buf[7]);
+
+        const t = compensate_temperature(self.cal, adc_t);
+        return Measurement{
+            .temperature = t.hundredths_c,
+            .pressure = compensate_pressure(self.cal, t.t_fine, adc_p),
+            .humidity = compensate_humidity(self.cal, t.t_fine, adc_h),
+        };
     }
 };
 
@@ -153,7 +224,7 @@ test "BME280 init verifies chip id" {
     const Test_Clock = mdf.base.Clock_Device.Test_Device;
 
     // Canned read responses, consumed in order. One read → the chip id.
-    const reads = [_][]const u8{&.{0x60}};
+    const reads = [_][]const u8{ &.{0x60}, &[_]u8{0} ** 26, &[_]u8{0} ** 7 };
     var td = Test_I2C.init(&reads, true);
     defer td.deinit();
     var tc = Test_Clock.init();
@@ -165,7 +236,7 @@ test "BME280 init verifies chip id" {
     });
 
     // init must have written the id register address (0xD0) to read it back.
-    try td.expect_sent(&.{&.{0xD0}});
+    try td.expect_sent(&.{ &.{0xD0}, &.{0x88}, &.{0xE1} });
 }
 
 test "BME280 init rejects wrong chip id" {
@@ -223,6 +294,49 @@ test "BME280 humidity compensation clamps to 0..100 %RH" {
     // Saturated: a max raw reading must never report above 100 %RH.
     // 100 %RH in Q22.10 == 100 * 1024 == 102400.
     try std.testing.expect(compensate_humidity(cal, t_fine, 65535) <= 100 * 1024);
+}
+
+test "BME280 init parses calibration and measure() reads + compensates" {
+    const Test_I2C = mdf.base.I2C_Device.Test_Device;
+    const Test_Clock = mdf.base.Clock_Device.Test_Device;
+
+    // test_calibration, encoded LE: T1,T2,T3, P1..P9, 0xA0 reserved, H1
+    const calib_tp = [_]u8{
+        0x45, 0x6F, 0x6F, 0x68, 0x32, 0x00,
+        0x82, 0x8F, 0x75, 0xD6, 0xD0, 0x0B,
+        0x3C, 0x1C, 0x66, 0xFF, 0xF9, 0xFF,
+        0xAC, 0x26, 0x0A, 0xD8, 0xBD, 0x10,
+        0x00, 0x4B,
+    };
+    // H2, H3, then H4/H5 packed (0xE4,0xE5,0xE6), H6 → H4=308, H5=0
+    const calib_h = [_]u8{ 0x6A, 0x01, 0x00, 0x13, 0x04, 0x00, 0x1E };
+    // data block 0xF7..0xFE → adc_p=0x523AC, adc_t=0x80000, adc_h=0x66CC
+    const data = [_]u8{ 0x52, 0x3A, 0xC0, 0x80, 0x00, 0x00, 0x66, 0xCC };
+
+    const reads = [_][]const u8{ &.{0x60}, &calib_tp, &calib_h, &data };
+    var td = Test_I2C.init(&reads, true);
+    defer td.deinit();
+    var tc = Test_Clock.init();
+
+    const dev = try BME280.init(.{
+        .i2c = td.i2c_device(),
+        .address = @enumFromInt(0x76),
+        .clock = tc.clock_device(),
+    });
+
+    try std.testing.expectEqual(test_calibration, dev.cal); // parsing (incl. H4/H5) is correct
+
+    const m = try dev.measure();
+    const t = compensate_temperature(dev.cal, 0x80000);
+    try std.testing.expectEqual(t.hundredths_c, m.temperature);
+    try std.testing.expectEqual(compensate_pressure(dev.cal, t.t_fine, 0x523AC), m.pressure);
+    try std.testing.expectEqual(compensate_humidity(dev.cal, t.t_fine, 0x66CC), m.humidity);
+
+    try td.expect_sent(&.{
+        &.{0xD0}, &.{0x88}, &.{0xE1}, // id, calib_tp, calib_h (init)
+        &.{ 0xF2, 0x01 }, &.{ 0xF4, 0x25 }, // ctrl_hum, ctrl_meas (measure)
+        &.{0xF7}, // data burst (measure)
+    });
 }
 
 // Float reference implementation, used only to cross-check the integer math in tests.
